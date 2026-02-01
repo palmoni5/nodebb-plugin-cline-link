@@ -2,31 +2,78 @@
 
 const plugin = {};
 
+// הגדרת חוקי הניקוי לכל אתר
+const CLEANING_RULES = [
+    {
+        name: 'AliExpress Short',
+        regex: /https?:\/\/(?:s\.click|a)\.aliexpress\.com\/\S+/g,
+        resolve: true // קישור מקוצר דורש פתיחה בשרת
+    },
+    {
+        name: 'AliExpress Direct',
+        regex: /https?:\/\/(?:\w+\.)?aliexpress\.com\/item\/\d+\.html\S*/g,
+        resolve: false // קישור ישיר - רק לנקות פרמטרים
+    },
+    {
+        name: 'Temu Short',
+        regex: /https?:\/\/(?:temu\.to|share\.temu\.com)\/\S+/g,
+        resolve: true
+    },
+    {
+        name: 'Temu Direct',
+        regex: /https?:\/\/(?:\w+\.)?temu\.com\/[\w\-\/]+\.html\S*/g,
+        resolve: false
+    },
+    {
+        name: 'Amazon Short',
+        regex: /https?:\/\/amzn\.to\/\S+/g,
+        resolve: true
+    },
+    {
+        name: 'Amazon Direct',
+        regex: /https?:\/\/(?:\w+\.)?amazon\.(?:com|co\.uk|de|it|fr|es|ca)\/(?:dp|gp\/product)\/[\w\d]+\S*/g,
+        resolve: false
+    },
+    {
+        name: 'eBay Short',
+        regex: /https?:\/\/ebay\.to\/\S+/g,
+        resolve: true
+    }
+];
+
 /**
- * פונקציה שמקבלת קישור מקוצר ומחזירה את הקישור הסופי והנקי
+ * פונקציה שמנקה את ה-URL מכל ה-Query Parameters
  */
-async function resolveAndCleanAliExpress(shortUrl) {
+function stripParameters(url) {
     try {
-        // מבצעים בקשה כדי לקבל את ה-URL הסופי אחרי הפניות
-        // משתמשים ב-method: 'GET' כי לעיתים HEAD לא מפעיל את כל שרשרת ההפניות באליאקספרס
-        const response = await fetch(shortUrl, {
+        const urlObj = new URL(url);
+        // עבור אמזון, לפעמים הקישור הנקי דורש את ה-Path עד ה-ASIN
+        // ברוב האתרים (עלי, טמו) איפוס ה-search וה-hash מספיק
+        urlObj.search = '';
+        urlObj.hash = '';
+        return urlObj.toString();
+    } catch (e) {
+        return url;
+    }
+}
+
+/**
+ * פונקציה שמנסה לגלות את הכתובת הסופית של קישור מקוצר
+ */
+async function resolveShortLink(url) {
+    try {
+        const response = await fetch(url, {
             method: 'GET',
             redirect: 'follow',
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36'
+            },
+            signal: AbortSignal.timeout(5000) // הגבלת זמן ל-5 שניות כדי לא לתקוע את השרת
         });
-
-        let finalUrl = response.url;
-
-        // ניקוי הפרמטרים מהקישור
-        // אליאקספרס בד"כ צריכים רק את הנתיב עד ה-.html
-        const urlObj = new URL(finalUrl);
-        
-        // הסרת כל ה-Query string (aff_id, sk, וכו')
-        urlObj.search = '';
-        
-        return urlObj.toString();
+        return response.url;
     } catch (err) {
-        console.error('[cline-links] Error resolving link:', shortUrl, err.message);
-        return shortUrl; // במקרה של שגיאה, מחזירים את המקור כדי לא להרוס את הפוסט
+        console.error(`[cline-links] Failed to resolve: ${url}`, err.message);
+        return url;
     }
 }
 
@@ -36,23 +83,34 @@ plugin.cleanLinks = async function (hookData) {
     }
 
     let content = hookData.post.content;
-    
-    // רג'קס לזיהוי קישורי אליאקספרס מקוצרים
-    const aliRegex = /https?:\/\/s\.click\.aliexpress\.com\/e\/[A-Za-z0-9_]+/g;
-    const matches = content.match(aliRegex);
+    let modified = false;
 
-    if (matches && matches.length > 0) {
-        // מסירים כפילויות כדי לא לעבוד פעמיים על אותו קישור
+    for (const rule of CLEANING_RULES) {
+        const matches = content.match(rule.regex);
+        if (!matches) continue;
+
         const uniqueMatches = [...new Set(matches)];
 
-        for (const shortUrl of uniqueMatches) {
-            const cleanUrl = await resolveAndCleanAliExpress(shortUrl);
-            
-            // החלפת הקישור המקוצר בקישור הנקי בתוך התוכן
-            // אנחנו משתמשים ב-split/join כדי להחליף את כל המופעים של הקישור הספציפי הזה
-            content = content.split(shortUrl).join(cleanUrl);
-        }
+        for (const matchedUrl of uniqueMatches) {
+            let finalUrl = matchedUrl;
 
+            // 1. אם החוק דורש פתיחה (קישור מקוצר)
+            if (rule.resolve) {
+                finalUrl = await resolveShortLink(matchedUrl);
+            }
+
+            // 2. ניקוי פרמטרים (תמיד מנקים בסוף כדי להיות בטוחים)
+            const cleanUrl = stripParameters(finalUrl);
+
+            // 3. החלפה בתוכן (רק אם הקישור באמת השתנה)
+            if (cleanUrl !== matchedUrl) {
+                content = content.split(matchedUrl).join(cleanUrl);
+                modified = true;
+            }
+        }
+    }
+
+    if (modified) {
         hookData.post.content = content;
     }
 
